@@ -1,0 +1,460 @@
+---
+title: "20Newsgroups"
+author: "Elisa Bankl"
+date: "2023-10-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tm)
+library(topicmodels)
+library(quanteda)
+```
+
+```{r}
+directory_location = "C:/Users/elisa/Documents/VWA-2/20news-18828.tar/20news-18828/20news-18828"
+```
+
+
+```{r}
+corpus_source = DirSource(directory = directory_location,recursive = TRUE)
+```
+
+#the newsgroup categories are in the names of the subfolders
+#create a vector with the newsgroups categories
+
+```{r}
+subfolder_names <- sapply(corpus_source$filelist, function(path) {
+  basename(dirname(file.path(directory_location, path)))
+})
+subfolder_names = unname(subfolder_names)
+```
+
+
+
+```{r}
+corpus = VCorpus(corpus_source)
+```
+
+#remove the ''From:' tags from the documents
+
+```{r}
+remove_from_tag <- content_transformer(function(x) {
+  gsub("^From:.*", "", x)
+})
+
+corpus <- tm_map(corpus, remove_from_tag)
+```
+
+
+
+#Shuffle corpus and metadata
+
+#only run once!!!!
+
+```{r}
+set.seed(123)  # Set a random seed for reproducibility
+shuffle_indices <- sample(length(corpus))
+corpus <- corpus[shuffle_indices]
+subfolder_names = subfolder_names[shuffle_indices]
+```
+#some preprocessing 
+
+#many of the steps could be also done while creating the document term matrix
+
+```{r}
+#this part was taken from https://ladal.edu.au/topicmodels.html on [12-10-2023]
+#set to lower case
+processedCorpus <- tm_map(corpus, content_transformer(tolower))
+
+#remove email adresses
+remove_words_with_at <- function(x) {
+  words <- unlist(strsplit(x, " "))  # Split the text into words
+  words <- words[!grepl("@", words)]    # Remove words containing '@'
+  cleaned_text <- paste(words, collapse = " ")  # Recombine the words into a single string
+  return(cleaned_text)
+}
+
+processedCorpus = tm_map(processedCorpus, content_transformer(remove_words_with_at))
+#remove stopwords and the names of the new
+processedCorpus <- tm_map(processedCorpus, removeWords, c(stopwords(),unique(subfolder_names)))
+#remove numbers
+processedCorpus <- tm_map(processedCorpus, removeNumbers)
+#remove punctuation
+processedCorpus <- tm_map(processedCorpus, removePunctuation, preserve_intra_word_dashes = TRUE)
+
+#stem
+processedCorpus <- tm_map(processedCorpus, stemDocument, language = "en")
+#strip white spaces
+processedCorpus <- tm_map(processedCorpus, stripWhitespace)
+```
+
+
+#create a Document Term Matrix
+
+
+#by default DTM uses the 'words' tokenizer
+
+
+#take only words that appear in least 10 document and at most 80% of documents in the corpus
+
+
+```{r}
+DTM <- tm::DocumentTermMatrix(processedCorpus, control = list(bounds = list(global = c(15, length(processedCorpus)*0.8))))
+```
+
+#compute another DTM with tfidf weighting
+
+```{r}
+DTM_tfidf <- tm::DocumentTermMatrix(DTM, control = list(bounds = list(global = c(15, length(processedCorpus)*0.8)),weighting = weightTf(DTM)))
+```
+
+# due to vocabulary pruning, we have empty rows in our DTM
+#we remove the empty documents from the DTM and also delete the corresponding metadata
+
+
+```{r}
+sel_indices <- slam::row_sums(DTM) > 0
+DTM <- DTM[sel_indices, ]
+subfolder_names <- subfolder_names[sel_indices]
+corpus <- corpus[sel_indices] #needed for visualizing the documents
+processedCorpus = processedCorpus[sel_indices]
+```
+
+#fit LDA using Gibbs Sampling
+
+```{r}
+set.seed(523)
+topicModel_lda <- topicmodels::LDA(DTM, 20, method="Gibbs", control=list(iter=2000,thin=2000,initialize = "random",best=TRUE))
+```
+
+
+
+#load the tidyr and the dplyr package
+
+```{r}
+library(tidyr)
+library(dplyr)
+```
+#convert the matrix theta into a dataframe
+
+
+```{r}
+order = table(topicModel_lda@z) #how often was a topic assigned to a token
+order = order(order(-order)) #order the topics by prevelance in the corpus
+theta_frame= data.frame(topicModel_lda@gamma) #convert the matrix theta into a dataframe
+topic_order = colnames(theta_frame)
+names(topic_order) <- order #map the old document names to the number
+```
+
+#get a dataframe with the thetas in one column and the metadata in a second column
+
+```{r}
+theta_wide <- tibble(theta_frame,'newsgroup'=unlist(shuffled_subfolder_names),'doc_length'=slam::row_sums(DTM, na.rm = TRUE))
+
+theta_wide %>% 
+  select(!doc_length)%>%
+  group_by(newsgroup) %>%
+  summarise_if(is.numeric, mean, na.rm = TRUE)%>%
+  tibble::remove_rownames() %>% 
+  tibble::column_to_rownames(var="newsgroup")->theta_average
+theta_average <- rename(theta_average, all_of(topic_order))
+```
+
+load pheatmap, RColorBrewer
+
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+```
+
+
+
+
+create heatmap and save it to png file
+
+```{r}
+png("heatmap.png", width = 700*300/100,height = 500*300/100,res=300)
+pheatmap(
+  as.matrix(
+      theta_average
+    ), 
+  color = colorRampPalette(brewer.pal(n = 7, name ="YlGnBu"))(100),
+  border_color = NA,scale ='none',angle_col=0)
+dev.off()
+```
+
+create a dtm with the unpreprocessed tokens, to get the unique tokens
+
+
+```{r}
+dtm_unprocessed <- DocumentTermMatrix(shuffled_corpus,control = list(removePunctuation=TRUE,tolower=TRUE,bounds =list(global=c(15,Inf))))
+```
+
+
+map the unprocessed tokens to processed tokens
+
+```{r}
+# Get the column names (words) from the unprocessed DTM
+words <- colnames(dtm_unprocessed)
+
+# Define preprocessing steps
+preprocess_word <- function(word) {
+  # Apply preprocessing steps to each word
+  word <- tolower(word)  
+  if ("@" %in% word){
+    return("")
+  }
+  if (word %in%stopwords()){
+    return("")
+  }
+  word = removeNumbers(word)# Remove numbers
+  word = removePunctuation(word, preserve_intra_word_dashes = TRUE)# Convert to lowercase
+  word = stripWhitespace(word)
+  
+  # Stem the word
+  word <- stemDocument(word)
+  return(word)
+}
+# Apply preprocessing steps to the words and create a named list
+word_mapping <- setNames(lapply(words, preprocess_word), words)
+```
+
+
+```{r}
+#list of colors that can be used to color text in latex
+list_of_latex_colors = c("red","green","blue","cyan","magenta","yellow","gray","teal","violet",'lime','brown','purple','orange','pink','olive')
+```
+
+
+#map the words to the indices of the processed word in the term list returned by LDA
+
+```{r}
+words_to_indices <- match(unlist(word_mapping), topicModel_lda@terms, nomatch = NULL)
+words_to_indices <- as.list(words_to_indices)
+names(words_to_indices) <- names(word_mapping)
+```
+
+#create a dataframe with z and the corresponding document and word index
+
+```{r}
+row_indices <- rep(DTM$i, DTM$v)
+col_indices <- rep(DTM$j, DTM$v)
+z_frame = data.frame(rows = row_indices,cols = col_indices,topic = topicModel_lda@z,accessed=0)
+```
+
+
+```{r}
+for(doc_number in c(231,6234,17121,15121)){ #doc_number = 231 #17121    #15121  #first docnumber: 231, then 6234, 
+
+
+
+#find the unprocessed words in the selected document by splitting the document at white spaces
+
+
+list_of_words_in_doc <- words(stripWhitespace(as.character(shuffled_corpus[[doc_number]])), " ")
+
+
+#map the words to their most probable topic in the specific document (using @wordassignments)
+
+
+#get the right row of the @wordassignments matrix
+row_values <- topicModel_lda@wordassignments[doc_number, ]
+#put the values (=most probable topic assignments for the words) in a list
+topic_word_map <- unlist(row_values$v)
+#the names of the list are the indices of the words
+names(topic_word_map) <- unlist(row_values$j)
+
+
+#create a list with the most probable topic assignments in the corpus
+
+#first get a list with the word indices of the words in the document
+topic_list = words_to_indices[removePunctuation(tolower(list_of_words_in_doc))]
+#replace NULLs by NAs
+topic_list <- lapply(topic_list, function(x) if (is.null(x)) NA else x)
+#now get the topics for the words, using the word indices and the topic_word_map 
+#obtained from @wordassignments
+topic_list = topic_word_map[as.character(unlist(topic_list))]
+
+#print out the latex code for the words in the document colored according to their most probable topic assignment
+
+sink(file = 'colortext/'+String(doc_number)+'.tex')
+vect=c()
+for(i in 1:length(list_of_words_in_doc)){
+if(is.na(topic_list[[i]])){
+append(vect,cat("\\textcolor{",'black','}{',list_of_words_in_doc[[i]],'} ',sep=""))}
+else if(topic_list[[i]]<=length(list_of_latex_colors)){
+  append(vect,cat("\\textcolor{",list_of_latex_colors[topic_list[[i]]],'}{',list_of_words_in_doc[[i]],'} ',sep=""))
+}
+else {
+append(vect,cat("\\colorbox{",list_of_latex_colors[topic_list[[i]]-length(list_of_latex_colors)],'}{',list_of_words_in_doc[[i]],'} ',sep=""))}
+}
+sink(file=NULL)
+
+}
+```
+
+```{r}
+for(doc_number in c(231,6234,17121,15121)){ #doc_number = 231 #17121    #15121  #first docnumber: 231, then 6234, 
+
+print(doc_number)
+
+#find the unprocessed words in the selected document by splitting the document at white spaces
+
+list_of_words_in_doc <- words(stripWhitespace(as.character(shuffled_corpus[[doc_number]])), " ")
+
+#first get a list with the word indices of the words in the document
+temp_list = tolower(list_of_words_in_doc)
+temp_list <- sapply(temp_list, function(x) if (x %in% stopwords()) NA else x)
+
+index_list = words_to_indices[removePunctuation(temp_list,preserve_intra_word_dashes = TRUE)]
+#replace NULLs by NAs
+index_list <- lapply(index_list, function(x) if (is.null(x)) NA else x)
+
+temp_z = z_frame[z_frame$rows == doc_number,]
+
+#print out the latex code for the words in the document colored according to their most probable topic assignment
+
+
+sink(file = 'colortext/z_'+String(doc_number)+'.tex')
+vect=c()
+for(i in 1:length(list_of_words_in_doc)){
+  index = index_list[[i]]
+if(is.na(index)){
+append(vect,cat("\\textcolor{",'black','}{',list_of_words_in_doc[[i]],'} ',sep=""))}
+else {
+  topic = temp_z[temp_z$cols == index & temp_z$accessed == 0,][1,"topic"]
+  temp_z[temp_z$cols == index,][1,"accessed"] <- 1
+  if(topic<=length(list_of_latex_colors)){
+    append(vect,cat("\\textcolor{",list_of_latex_colors[topic],'}{',list_of_words_in_doc[[i]],'} ',sep=""))
+  }
+
+else {
+append(vect,cat("\\colorbox{",list_of_latex_colors[topic-length(list_of_latex_colors)],'}{',list_of_words_in_doc[[i]],'} ',sep=""))}
+}
+}
+sink(file=NULL)
+
+}
+```
+
+```{r}
+for(doc_number in c(231,6234,17121,15121)){ #doc_number = 231 #17121    #15121  #first docnumber: 231, then 6234, 
+
+print(doc_number)
+
+#find the unprocessed words in the selected document by splitting the document at white spaces
+
+list_of_words_in_doc <- words(stripWhitespace(as.character(processedCorpus[[doc_number]])), " ")
+
+#first get a list with the word indices of the words in the document
+
+
+index_list = match(list_of_words_in_doc,topicModel_lda@terms,nomatch =NULL)
+#replace NULLs by NAs
+index_list <- lapply(index_list, function(x) if (is.null(x)) NA else x)
+
+temp_z = z_frame[z_frame$rows == doc_number,]
+
+#print out the latex code for the words in the document colored according to their most probable topic assignment
+
+
+sink(file = 'colortext/z_processed_'+String(doc_number)+'.tex')
+vect=c()
+for(i in 1:length(list_of_words_in_doc)){
+  index = index_list[[i]]
+if(is.na(index)){}
+else {
+  topic = temp_z[temp_z$cols == index & temp_z$accessed == 0,][1,"topic"]
+  temp_z[temp_z$cols == index,][1,"accessed"] <- 1
+  if(topic<=length(list_of_latex_colors)){
+    append(vect,cat("\\textcolor{",list_of_latex_colors[topic],'}{',list_of_words_in_doc[[i]],'} ',sep=""))
+  }
+
+else {
+append(vect,cat("\\colorbox{",list_of_latex_colors[topic-length(list_of_latex_colors)],'}{',list_of_words_in_doc[[i]],'} ',sep=""))}
+}
+}
+sink(file=NULL)
+
+}
+```
+
+```{r}
+library(LDAvis)
+```
+
+```{r}
+# based on this code: https://gist.github.com/trinker/477d7ae65ff6ca73cace
+#i just realized, that code is not correct
+#need to use DTM instead of wordassignments for doc.length and term.frequency
+topicmodels2LDAvis <- function(x,DTM){
+    post <- topicmodels::posterior(x)
+    if (ncol(post[["topics"]]) < 3) stop("The model must contain > 2 topics")
+    mat <- x@wordassignments
+    LDAvis::createJSON(
+        phi = post[["terms"]], 
+        theta = post[["topics"]],
+        vocab = colnames(post[["terms"]]),
+        doc.length = slam::row_sums(DTM, na.rm = TRUE),
+        term.frequency = slam::col_sums(DTM, na.rm = TRUE),
+        R = 30
+    )
+}
+
+```
+
+```{r}
+LDAvis::serVis(topicmodels2LDAvis(topicModel_lda,DTM))
+```
+
+
+#convert the DTM to a quanteda DFM
+
+```{r}
+library(tidytext)
+```
+
+
+```{r}
+DFM = cast_dfm(tidy(DTM),document,term,count)
+```
+
+```{r}
+quanteda_lsa = quanteda.textmodels::textmodel_lsa(DFM,150)
+```
+
+#load the LSAfun package
+
+```{r}
+library(LSAfun)
+```
+#money, buy, disk
+#health
+
+```{r}
+LSAfun::plot_neighbors("health",n=10,tvectors=quanteda_lsa$features,connect.lines='all')
+```
+
+```{r}
+LSAfun::plot_wordlist(x = c("islam","judaism","christian","atheism","buddhist","cathol","agnost","church"),connect.lines='all',tvectors = quanteda_lsa$features,dims = 3)
+```
+
+```{r}
+LSAfun::plot_wordlist(x = c("car","bike","drive","oil","atheism","buddhist","cathol","agnost","church"),connect.lines='all',tvectors = quanteda_lsa$features,dims = 3)
+```
+
+
+
+```{r}
+LSAfun::plot_neighbors(Predication("drive","car",m=30,k=5,tvectors= quanteda_lsa$features)$PA,n=10,tvectors=quanteda_lsa$features,connect.lines='all')
+```
+
+```{r}
+LSAfun::plot_neighbors(compose("money","chain",tvectors= quanteda_lsa$features),n=10,tvectors=quanteda_lsa$features,connect.lines='all')e
+```
