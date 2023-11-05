@@ -2,7 +2,7 @@
 title: "20Newsgroups"
 author: "Elisa Bankl"
 date: "2023-10-01"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
